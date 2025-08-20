@@ -8,7 +8,7 @@
 // ============================
 // CONFIGURAÇÕES DO PROJETO
 // ============================
-#define DEVICE_A 0 // 1 = Dispositivo A (Ping) | 0 = Dispositivo B (Pong)
+#define DEVICE_A  1 // 1 = Dispositivo A (Ping) | 0 = Dispositivo B (Pong)
 
 #define PIN_MISO 16
 #define PIN_CS 17
@@ -23,6 +23,15 @@
 
 #define LORA_SPI spi0
 #define LORA_FREQ 915E6
+
+// ============================
+// CONFIGURAÇÕES DE TEMPO (ms)
+// ============================
+#define TX_TIMEOUT_MS       5000   // tempo máximo esperando TxDone
+#define RX_TIMEOUT_MS       8000   // tempo máximo esperando resposta Pong
+#define PING_INTERVAL_MS    4000   // intervalo entre pings (lado A)
+#define RETRY_DELAY_MS      2000   // atraso entre tentativas após erro
+
 
 // ============================
 // VARIÁVEIS GLOBAIS
@@ -138,20 +147,23 @@ bool lora_init() {
     lora_write_reg(0x08, (uint8_t)(frf >> 0));
 
     lora_write_reg(0x09, 0xFF); // PaConfig: Max Power
-    lora_write_reg(0x4D, 0x07); // PaDac: Boost mode
+    lora_write_reg(0x4D, 0x87); // PaDac: Boost mode - OFF
+    lora_write_reg(0x0B, 0x20); // OCP default
+    lora_write_reg(0x39, 0x12);
 
-    lora_write_reg(0x1D, 0x68); // ModemConfig1: BW125kHz, CR 4/5
+
+    lora_write_reg(0x1D, 0x78); // ModemConfig1: BW62,5kHz, CR 4/8
     // lora_write_reg(0x1D, 0x62 ou 0x18 ou 0x68);
 
-    lora_write_reg(0x1E, 0x84); // ModemConfig2: SF7, CRC on
+    lora_write_reg(0x1E, 0xC4); // ModemConfig2: SF12, CRC on
     //lora_write_reg(0x1E, 0xC4); // ModemConfig2: SF12, CRC on
 
-    lora_write_reg(0x26, 0x0C); // ModemConfig3: LowDataRateOptimize off, AgcAutoOn on (bit2)
+    lora_write_reg(0x26, 0x0C); // ModemConfig3: LowDataRateOptimize on, AgcAutoOn on (bit2)
     // lora_write_reg(0x26, 0x0C ou 0x08); // ModemConfig3: LowDataRateOptimize on, AgcAutoOn on (bit2)
 
 
-    lora_write_reg(0x20, 0x00); // Preamble Length LS
-    lora_write_reg(0x21, 0x0C); // Preamble Length MSB
+    lora_write_reg(0x20, 0x00); // Preamble Length MSB
+    lora_write_reg(0x21, 0x0C); // Preamble Length LSB
     // lora_write_reg(0x21, 0x10 ou 0x0C); // Preamble Length MSB
 
     lora_write_reg(0x0E, 0x00); // FifoTxBaseAddr
@@ -159,7 +171,7 @@ bool lora_init() {
 
     lora_write_reg(0x0C, 0x23); // LNA boost para RX
     lora_write_reg(0x11, 0x00); // libera todas as IRQs
-
+    lora_write_reg(0x12, 0xFF); // limpa IRQs777
 
     #if DEVICE_A
         lora_dio0_map_Txdone(); // DIO0 -> TxDone
@@ -227,7 +239,7 @@ bool lora_send(const char *msg) {
     absolute_time_t start_time = get_absolute_time();
     while (!tx_done) {
         handle_dio0_events(); // NOVO
-        if (absolute_time_diff_us(start_time, get_absolute_time()) > 1000 * 1000) {
+        if (absolute_time_diff_us(start_time, get_absolute_time()) > ( TX_TIMEOUT_MS * 1000)) {
             report_error("Timeout de transmissão! Verifique DIO0.", false);
             return false;
         }
@@ -241,9 +253,10 @@ bool lora_send(const char *msg) {
 }
 
 static inline void lora_start_rx_continuous(void) {
-    lora_write_reg(0x12, 0xFF); // Limpa todas as IRQs
-    lora_dio0_map_Rxdone(); // Mapeia DIO0 para RxDone
-    lora_set_mode(0x05); // RX Continuous
+    lora_write_reg(0x12, 0xFF);        // limpa IRQs
+    lora_dio0_map_Rxdone();            // DIO0 = RxDone
+    lora_write_reg(0x0D, 0x00);        // FifoAddrPtr = FifoRxBaseAddr (0x00)
+    lora_set_mode(0x05);               // RX Continuous
 }
 
 bool lora_receive(char *buf, size_t maxlen) {
@@ -309,7 +322,7 @@ int main() {
 
             // 1) Transmite (DIO0=TxDone)
             if (!lora_send(msg)) {
-                sleep_ms(2000);
+                sleep_ms(RETRY_DELAY_MS);
                 continue;
             }
 
@@ -319,7 +332,7 @@ int main() {
 
             bool pong_recebido = false;
             absolute_time_t start_time = get_absolute_time();
-            while (absolute_time_diff_us(start_time, get_absolute_time()) < 3000 * 1000) {
+            while (absolute_time_diff_us(start_time, get_absolute_time()) < (RX_TIMEOUT_MS * 1000)) {
                 handle_dio0_events(); // NOVO
                 if (lora_receive(buf, sizeof(buf))) {
                     if (strstr(buf, "Pong") != NULL) {
@@ -339,7 +352,7 @@ int main() {
                 report_error("Timeout de protocolo! Nenhuma resposta Pong recebida.", false);
                 printf("\n");
             }
-            sleep_ms(3000);
+            sleep_ms(PING_INTERVAL_MS);
         }
 
     #else
