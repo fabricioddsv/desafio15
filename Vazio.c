@@ -33,10 +33,33 @@ volatile bool rx_done = false;
 // ============================
 // FUNÇÕES DE BAIXO NÍVEL
 // ============================
+void pisca_led(uint led_pin, int ms);
+void lora_reset();
+void report_error(const char* message, bool fatal);
+void lora_write_reg(uint8_t reg, uint8_t value);
+uint8_t lora_read_reg(uint8_t reg);
+void lora_write_fifo(const uint8_t *data, uint8_t len);
+void lora_read_fifo(uint8_t *data, uint8_t len);
+void lora_set_mode(uint8_t mode);
+bool lora_init();
+void dio0_irq_handler(uint gpio, uint32_t events);
+void handle_dio0_events(void);   // NOVO
+bool lora_send(const char *msg);
+bool lora_receive(char *buf, size_t maxlen);
+
 static inline void cs_select() { gpio_put(PIN_CS, 0); }
 static inline void cs_deselect() { gpio_put(PIN_CS, 1); }
 
+static inline void lora_dio0_map_Txdone(void) {lora_write_reg(0x40, 0x40); } // Mapeia DIO0 para TxDone
+static inline void lora_dio0_map_Rxdone(void) {lora_write_reg(0x40, 0x00); } // Mapeia DIO0 para RxDone
+
+volatile uint8_t dio0_event = 0; // 0 = none, 1 = occurred
+
 void pisca_led(uint led_pin, int ms) {
+    gpio_put(LED_AZUL, 0);
+    gpio_put(LED_VERDE, 0);
+    gpio_put(LED_ERROR, 0);
+
     gpio_put(led_pin, 1);
     sleep_ms(ms);
     gpio_put(led_pin, 0);
@@ -48,6 +71,7 @@ void lora_reset() {
 }
 
 // NOVO: Função central para reportar erros
+
 void report_error(const char* message, bool fatal) {
     printf("[ERRO] %s\n", message);
     if (fatal) {
@@ -61,12 +85,14 @@ void report_error(const char* message, bool fatal) {
     }
 }
 
+
 void lora_write_reg(uint8_t reg, uint8_t value) {
     uint8_t buf[2] = { (uint8_t)(reg | 0x80), value };
     cs_select();
     spi_write_blocking(LORA_SPI, buf, 2);
     cs_deselect();
 }
+
 
 uint8_t lora_read_reg(uint8_t reg) {
     uint8_t buf[2] = { reg & 0x7F, 0x00 };
@@ -87,7 +113,6 @@ void lora_write_fifo(const uint8_t *data, uint8_t len) {
 
 void lora_read_fifo(uint8_t *data, uint8_t len) {
     cs_select();
-
     uint8_t addr = 0x00;
     spi_write_blocking(LORA_SPI, &addr, 1);
     spi_read_blocking(LORA_SPI, 0x00, data, len);
@@ -101,9 +126,12 @@ void lora_set_mode(uint8_t mode) {
 // ATUALIZADO: lora_init agora checa se o módulo foi encontrado
 bool lora_init() {
     lora_reset();
+    
     lora_set_mode(0x00); // Sleep
     lora_set_mode(0x01); // Standby
-
+    
+    lora_write_reg(0x12, 0xFF); // Limpa todas as IRQs
+    
     uint64_t frf = ((uint64_t)LORA_FREQ << 19) / 32000000;
     lora_write_reg(0x06, (uint8_t)(frf >> 16));
     lora_write_reg(0x07, (uint8_t)(frf >> 8));
@@ -112,13 +140,23 @@ bool lora_init() {
     lora_write_reg(0x09, 0xFF); // PaConfig: Max Power
     lora_write_reg(0x1D, 0x72); // ModemConfig1: BW125kHz, CR 4/5
     lora_write_reg(0x1E, 0x74); // ModemConfig2: SF7, CRC on
+    lora_write_reg(0x26, 0x04); // ModemConfig3: LowDataRateOptimize off, AgcAutoOn on (bit2)
 
     lora_write_reg(0x20, 0x00); // Preamble Length LS
     lora_write_reg(0x21, 0x08); // Preamble Length MSB
     lora_write_reg(0x0E, 0x00); // FifoTxBaseAddr
     lora_write_reg(0x0F, 0x00); // FifoRxBaseAddr
 
-    lora_write_reg(0x40, 0x00); // DioMapping1: DIO0 -> RX_DONE / TX_DONE
+    lora_write_reg(0x0C, 0x23); // LNA boost para RX
+    lora_write_reg(0x11, 0x00); // libera todas as IRQs
+
+
+    #if DEVICE_A
+        lora_dio0_map_Txdone(); // DIO0 -> TxDone
+    #else
+        lora_dio0_map_Rxdone(); // DIO0 -> RxDone
+    #endif
+    
     // NOVO: Verificação de hardware
     uint8_t version = lora_read_reg(0x42); // 0x42 é o registrador REG_VERSION
     if (version == 0x12) { // 0x12 é o valor esperado para chips SX127x
@@ -130,77 +168,93 @@ bool lora_init() {
     }
 }
 
+// ============================
+// ISR + HANDLER
+// ============================
 void dio0_irq_handler(uint gpio, uint32_t events) {
-    uint8_t irq_flags = lora_read_reg(0x12);
+    (void)gpio; (void)events;
+    dio0_event = true; // só marca evento
+}
 
+void handle_dio0_events(void) {
+    if (!dio0_event) return;
+    dio0_event = false;
+
+    uint8_t irq_flags = lora_read_reg(0x12);
     lora_write_reg(0x12, 0xFF);
+
     printf("IRQ Flags: 0x%02X\n", irq_flags);
-    
+
     if ((irq_flags & 0x40) && !(irq_flags & 0x20)) {
         rx_done = true;
-    } 
-    else if (irq_flags & 0x08) {
+    } else if (irq_flags & 0x08) {
         tx_done = true;
-    } 
-    else if (irq_flags & 0x20) {
-        report_error("CRC Inválido no pacote recebido! Pacote descartado.\n", false);
+    } else if (irq_flags & 0x20) {
+        report_error("CRC inválido no pacote recebido!", false);
     }
 }
 
 // ATUALIZADO: lora_send agora tem timeout
 bool lora_send(const char *msg) {
     if (strlen(msg) > 255) {
-        report_error("Mensagem muito longa para enviar (max 255 bytes).\n", false);
+        report_error("Mensagem muito longa (max 255).", false);
         return false;
     }
 
-    lora_set_mode(0x01); // Standby
+    lora_set_mode(0x01); 
     lora_write_reg(0x0D, 0x00);
+    printf("Carregando payload...\n");
     lora_write_fifo((const uint8_t*)msg, strlen(msg));
     lora_write_reg(0x22, strlen(msg));
 
-    lora_set_mode(0x03); // TX
-    tx_done = false;
+    lora_write_reg(0x12, 0xFF);
+    lora_dio0_map_Txdone();
 
-    // NOVO: Timeout de transmissão
-    /*absolute_time_t start_time = get_absolute_time();
+    tx_done = false;
+    printf("Iniciando TX...\n");
+    lora_set_mode(0x03);
+
+    absolute_time_t start_time = get_absolute_time();
     while (!tx_done) {
-        if (absolute_time_diff_us(start_time, get_absolute_time()) > 500 * 1000) { // Timeout de 500ms
-            report_error("Timeout de transmissão! Interrupção TX_DONE não ocorreu. Verifique a conexão do pino DIO0.\n", false);
-            lora_init(); // Tenta resetar o módulo para um estado conhecido
+        handle_dio0_events(); // NOVO
+        if (absolute_time_diff_us(start_time, get_absolute_time()) > 1000 * 1000) {
+            report_error("Timeout de transmissão! Verifique DIO0.", false);
             return false;
         }
-    }*/
-    sleep_ms(10); // Pequeno atraso para garantir que o TX_DONE seja processado
-    //tx_done = true; // Simula que a transmissão foi bem-sucedida
-    //lora_set_mode(0x01); // Volta para Standby após TX
+        tight_loop_contents();
+    }
 
+    lora_set_mode(0x01);
     printf("Enviado: \"%s\"\n", msg);
     pisca_led(LED_AZUL, 100);
     return true;
 }
 
+static inline void lora_start_rx_continuous(void) {
+    lora_write_reg(0x12, 0xFF); // Limpa todas as IRQs
+    lora_dio0_map_Rxdone(); // Mapeia DIO0 para RxDone
+    lora_set_mode(0x05); // RX Continuous
+}
+
 bool lora_receive(char *buf, size_t maxlen) {
-    if (rx_done) {
-        rx_done = false;
-        uint8_t len = lora_read_reg(0x13);
+    if (!rx_done) return false;
+    rx_done = false;
 
-        // AVISO: Checa se o pacote cabe no buffer
-        if (len > maxlen - 1) {
-            printf("[AVISO] Pacote recebido (%d bytes) foi truncado para caber no buffer (%d bytes).\n", len, maxlen-1);
-            len = maxlen - 1;
-        }
-
-        uint8_t fifo_addr = lora_read_reg(0x10);
-        lora_write_reg(0x0D, fifo_addr);
-        lora_read_fifo((uint8_t*)buf, len);
-        buf[len] = '\0';
-
-        printf("Recebido: \"%s\"\n", buf);
-        pisca_led(LED_VERDE, 100);
-        return true;
+    uint8_t len = lora_read_reg(0x13); // RegRxNbBytes
+    if (len > maxlen - 1) {
+        printf("[AVISO] Pacote de %u bytes truncado para %u.\n", len, (unsigned)(maxlen - 1));
+        len = (uint8_t)(maxlen - 1);
     }
-    return false;
+
+    uint8_t fifo_addr = lora_read_reg(0x10); // RegFifoRxCurrentAddr
+    lora_write_reg(0x0D, fifo_addr);
+
+    lora_read_fifo((uint8_t*)buf, len);
+    buf[len] = '\0';
+
+    printf("[RX] \"%s\"\n", buf);
+    pisca_led(LED_VERDE, 100);
+    return true;
 }
 
 // ============================
@@ -220,7 +274,9 @@ int main() {
     gpio_init(LED_AZUL); gpio_set_dir(LED_AZUL, GPIO_OUT);
     gpio_init(LED_VERDE); gpio_set_dir(LED_VERDE, GPIO_OUT);
     gpio_init(LED_ERROR); gpio_set_dir(LED_ERROR, GPIO_OUT);
+    
     gpio_init(PIN_DIO0); gpio_set_dir(PIN_DIO0, GPIO_IN);
+    gpio_pull_down(PIN_DIO0); // Pull-down para evitar flutuação
     gpio_set_irq_enabled_with_callback(PIN_DIO0, GPIO_IRQ_EDGE_RISE, true, &dio0_irq_handler);
 
     // NOVO: Checa se a inicialização do LoRa foi bem-sucedida
@@ -241,29 +297,27 @@ int main() {
             snprintf(msg, sizeof(msg), "Ping %d", msg_id);
 
 
-            if (lora_send(msg)) {
-                // Mensagem enviada com sucesso
-            } 
-            else {
-                // Erro na transmissão já reportado em lora_send
-                sleep_ms(3000);
-                continue; // Tenta enviar novamente após o atraso
+            // 1) Transmite (DIO0=TxDone)
+            if (!lora_send(msg)) {
+                sleep_ms(2000);
+                continue;
             }
 
-            // Espera pela resposta "Pong"
+            // 2) Escuta o Pong (DIO0=RxDone)
             printf("Aguardando resposta Pong...\n");
-            rx_done = false;
-            lora_set_mode(0x05);
+            lora_start_rx_continuous(); // garante DIO0=RxDone + RX contínuo
 
             bool pong_recebido = false;
             absolute_time_t start_time = get_absolute_time();
-            while (absolute_time_diff_us(start_time, get_absolute_time()) < 2000 * 1000) { // Timeout de 2s
+            while (absolute_time_diff_us(start_time, get_absolute_time()) < 3000 * 1000) {
+                handle_dio0_events(); // NOVO
                 if (lora_receive(buf, sizeof(buf))) {
                     if (strstr(buf, "Pong") != NULL) {
                         pong_recebido = true;
                         break;
                     }
                 }
+                tight_loop_contents();
             }
 
             if (pong_recebido) {
@@ -283,18 +337,22 @@ int main() {
         // LÓGICA DO DISPOSITIVO B (PONG)
         // ===================================
         printf("\n--- Dispositivo B (Pong / Receptor) iniciado ---\n");
-        lora_set_mode(0x05);
+        // fica sempre em RX contínuo com DIO0=RxDone
+        lora_start_rx_continuous();
+
         while (true) {
+            handle_dio0_events(); // NOVO
             if (lora_receive(buf, sizeof(buf))) {
                 if (strstr(buf, "Ping") != NULL) {
                     char ack_msg[48];
                     snprintf(ack_msg, sizeof(ack_msg), "Pong para: %s", buf);
-                    lora_send(ack_msg);
-                    printf("\n");
-                    lora_set_mode(0x05); // Essencial: voltar a escutar
+
+                    if (lora_send(ack_msg)) {
+                        lora_start_rx_continuous();
+                    }
                 }
             }
-            sleep_ms(10);
+            tight_loop_contents();
         }
     #endif
 }
