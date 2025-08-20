@@ -8,7 +8,7 @@
 // ============================
 // CONFIGURAÇÕES DO PROJETO
 // ============================
-#define DEVICE_A 1 // 1 = Dispositivo A (Ping) | 0 = Dispositivo B (Pong)
+#define DEVICE_A 0 // 1 = Dispositivo A (Ping) | 0 = Dispositivo B (Pong)
 
 #define PIN_MISO 16
 #define PIN_CS 17
@@ -138,12 +138,22 @@ bool lora_init() {
     lora_write_reg(0x08, (uint8_t)(frf >> 0));
 
     lora_write_reg(0x09, 0xFF); // PaConfig: Max Power
+    lora_write_reg(0x4D, 0x07); // PaRamp: 3.4ms
+
     lora_write_reg(0x1D, 0x72); // ModemConfig1: BW125kHz, CR 4/5
+    // lora_write_reg(0x1D, 0x62 ou 0x18 ou 0x68);
+
     lora_write_reg(0x1E, 0x74); // ModemConfig2: SF7, CRC on
+    //lora_write_reg(0x1E, 0xC4); // ModemConfig2: SF12, CRC on
+
     lora_write_reg(0x26, 0x04); // ModemConfig3: LowDataRateOptimize off, AgcAutoOn on (bit2)
+    // lora_write_reg(0x26, 0x0C ou 0x08); // ModemConfig3: LowDataRateOptimize on, AgcAutoOn on (bit2)
+
 
     lora_write_reg(0x20, 0x00); // Preamble Length LS
     lora_write_reg(0x21, 0x08); // Preamble Length MSB
+    // lora_write_reg(0x21, 0x10 ou 0x0C); // Preamble Length MSB
+
     lora_write_reg(0x0E, 0x00); // FifoTxBaseAddr
     lora_write_reg(0x0F, 0x00); // FifoRxBaseAddr
 
@@ -348,6 +358,8 @@ int main() {
                     snprintf(ack_msg, sizeof(ack_msg), "Pong para: %s", buf);
 
                     if (lora_send(ack_msg)) {
+                        printf("\n");
+                        // volta para RX contínuo
                         lora_start_rx_continuous();
                     }
                 }
